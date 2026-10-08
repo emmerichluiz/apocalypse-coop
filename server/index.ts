@@ -1,6 +1,7 @@
 import express from 'express';
 import http from 'http';
-import { Server } from 'socket.io';
+import { Server, Socket } from 'socket.io';
+import { GameStateStore } from './state';
 
 const app = express();
 const server = http.createServer(app);
@@ -10,143 +11,98 @@ const io = new Server(server, {
   },
 });
 
+const store = new GameStateStore();
 const PORT = 3001;
 
-interface PlayerState {
-  id: string;
-  x: number;
-  y: number;
-  vx: number;
-  vy: number;
-  facing: number;
-  isGrounded: boolean;
-  health: number;
-  color: number;
-  name: string;
-}
-
-interface BulletState {
-  id: string;
-  x: number;
-  y: number;
-  vx: number;
-  vy: number;
-  ttl: number;
-}
-
-interface ZombieState {
-  id: string;
-  x: number;
-  y: number;
-  speed: number;
-  hp: number;
-}
-
-const players = new Map<string, PlayerState>();
-const bullets: BulletState[] = [];
-const zombies: ZombieState[] = [];
-
-for (let i = 0; i < 10; i++) {
-  zombies.push({
-    id: `z-${i}`,
-    x: 800 + i * 220,
-    y: 470,
-    speed: 1.3 + Math.random() * 0.7,
-    hp: 100,
-  });
-}
-
-const getWorldState = () => ({
-  players: Array.from(players.values()),
-  bullets,
-  zombies,
-});
-
-io.on('connection', (socket) => {
+io.on('connection', (socket: Socket) => {
   socket.emit('welcome', { id: socket.id });
 
-  players.set(socket.id, {
+  store.players.set(socket.id, {
     id: socket.id,
+    name: `Player-${socket.id.slice(0, 4)}`,
     x: 180,
-    y: 440,
+    y: 420,
     vx: 0,
     vy: 0,
+    width: 30,
+    height: 52,
     facing: 1,
-    isGrounded: true,
+    onGround: true,
     health: 100,
-    color: socket.id.length % 2 === 0 ? 0x4cc9f0 : 0xf72585,
-    name: `Player-${socket.id.slice(0, 4)}`,
+    color: socket.id.length % 2 === 0 ? 0x64c7ff : 0xf77d7d,
   });
 
   socket.on('join', () => {
-    io.emit('state', getWorldState());
+    io.emit('state', store.getSnapshot());
   });
 
-  socket.on('input', (input) => {
-    const player = players.get(socket.id);
-    if (!player) {
-      return;
+  socket.on('input', ({ x, jump }: { x: number; jump: boolean }) => {
+    const player = store.players.get(socket.id);
+    if (!player) return;
+
+    const move = Number(x || 0);
+    player.x += move * 5;
+    player.facing = move < 0 ? -1 : move > 0 ? 1 : player.facing;
+
+    if (jump && player.onGround) {
+      player.vy = -430;
+      player.onGround = false;
     }
 
-    const move = Number(input.x ?? 0);
-    player.x += move * 4;
-    player.facing = move >= 0 ? 1 : -1;
-
-    if (input.jump) {
-      player.y -= 140;
-    }
-
-    if (input.shoot) {
-      bullets.push({
-        id: `${socket.id}-${Date.now()}`,
-        x: player.x + 26 * player.facing,
-        y: player.y - 8,
-        vx: 10 * player.facing,
-        vy: 0,
-        ttl: 120,
-      });
-    }
-
-    player.y = Math.min(440, Math.max(250, player.y));
+    player.x = Math.max(40, Math.min(store.worldWidth - 40, player.x));
   });
 
-  socket.on('shoot', () => {
-    const player = players.get(socket.id);
-    if (!player) {
-      return;
-    }
+  socket.on('shoot', ({ direction }: { direction: 1 | -1 }) => {
+    const player = store.players.get(socket.id);
+    if (!player) return;
 
-    bullets.push({
-      id: `${socket.id}-${Date.now()}`,
-      x: player.x + 28 * player.facing,
+    const projectileId = `p-${Date.now()}-${socket.id}`;
+    store.projectiles.set(projectileId, {
+      id: projectileId,
+      ownerId: socket.id,
+      x: player.x + direction * 25,
       y: player.y - 8,
-      vx: 12 * player.facing,
+      vx: direction * 12,
       vy: 0,
+      radius: 4,
       ttl: 150,
+      damage: 25,
     });
   });
 
   socket.on('disconnect', () => {
-    players.delete(socket.id);
-    io.emit('state', getWorldState());
+    store.players.delete(socket.id);
+    io.emit('state', store.getSnapshot());
   });
 });
 
 setInterval(() => {
-  for (const bullet of bullets) {
-    bullet.x += bullet.vx;
-    bullet.ttl -= 1;
-  }
+  for (const [id, projectile] of store.projectiles.entries()) {
+    projectile.x += projectile.vx;
+    projectile.ttl -= 1;
 
-  for (let i = bullets.length - 1; i >= 0; i--) {
-    if (bullets[i].ttl <= 0) {
-      bullets.splice(i, 1);
+    if (projectile.ttl <= 0) {
+      store.projectiles.delete(id);
     }
   }
 
-  io.emit('state', getWorldState());
+  for (const [id, zombie] of store.zombies.entries()) {
+    zombie.x += zombie.direction * zombie.speed * 0.8;
+
+    if (zombie.x < 80) {
+      zombie.x = 80;
+      zombie.direction = 1;
+    }
+
+    if (zombie.x > store.worldWidth - 160) {
+      zombie.x = store.worldWidth - 160;
+      zombie.direction = -1;
+    }
+  }
+
+  io.emit('state', store.getSnapshot());
 }, 30);
 
 server.listen(PORT, () => {
-  console.log(`Servidor de jogo em execução em http://localhost:${PORT}`);
+  console.log(`Servidor multiplayer em execução em http://localhost:${PORT}`);
 });
